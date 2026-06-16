@@ -106,7 +106,7 @@ CFG = {
     "payout_ratio":                 0.3429,  # profit/stake = 0.12/0.35 (actual observed)
 
     # ── Signal ──
-    "warmup_ticks":       800,          # need 80 ticks to fill order-3 Markov table
+    "warmup_ticks":       80,           # need 80 ticks to fill order-3 Markov table
     "signal_interval":    1,           # evaluate every tick (1-tick contracts)
     "min_confidence":     0.74,        # ensemble gate (above 70% base rate)
     "markov_order":       3,           # use last 3 digits as state
@@ -141,7 +141,7 @@ CFG = {
     "signals_csv": "over2_signals.csv",
     "trades_csv":  "over2_trades.csv",
     "wfv_csv":     "wfv_live_results.csv",
-    "tick_buffer": 1500,  # enlarged to support WFV windows
+    "tick_buffer": 2000,  # must exceed wfv_is_size+wfv_oos_size+warmup (800+750+80=1630)
 
     # ── Walk-Forward Validator ──
     "wfv_enabled":           True,
@@ -768,7 +768,6 @@ class Ensemble:
         hmm_state:  int,
         sampen_veto: bool,
         copula_veto: bool,
-        min_confidence: float = CFG["min_confidence"],
     ) -> tuple:
 
         scores = {
@@ -798,8 +797,8 @@ class Ensemble:
         W    = MODEL_WEIGHTS_BY_REGIME.get(hmm_state, MODEL_WEIGHTS_BY_REGIME[1])
         conf = float(np.clip(sum(scores[k] * W[k] for k in W), 0.0, 1.0))
 
-        if conf < min_confidence:
-            return False, conf, scores, [], f"CONF_LOW({conf:.3f}<{min_confidence})"
+        if conf < CFG["min_confidence"]:
+            return False, conf, scores, [], f"CONF_LOW({conf:.3f}<{CFG['min_confidence']})"
 
         return True, conf, scores, [], "TRADE"
 
