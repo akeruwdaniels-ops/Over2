@@ -768,6 +768,7 @@ class Ensemble:
         hmm_state:  int,
         sampen_veto: bool,
         copula_veto: bool,
+        min_confidence: float = CFG["min_confidence"],
     ) -> tuple:
 
         scores = {
@@ -797,8 +798,8 @@ class Ensemble:
         W    = MODEL_WEIGHTS_BY_REGIME.get(hmm_state, MODEL_WEIGHTS_BY_REGIME[1])
         conf = float(np.clip(sum(scores[k] * W[k] for k in W), 0.0, 1.0))
 
-        if conf < CFG["min_confidence"]:
-            return False, conf, scores, [], f"CONF_LOW({conf:.3f}<{CFG['min_confidence']})"
+        if conf < min_confidence:
+            return False, conf, scores, [], f"CONF_LOW({conf:.3f}<{min_confidence})"
 
         return True, conf, scores, [], "TRADE"
 
