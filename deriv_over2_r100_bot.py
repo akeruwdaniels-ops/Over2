@@ -94,7 +94,7 @@ CFG = {
     "duration_unit":     "t",
 
     # ── Capital ──
-    "starting_bankroll":  10.00,
+    "starting_bankroll":  1.00,
     "stake":               0.35,       # flat stake (small account)
     "drawdown_stop":       0.70,       # halt below this bankroll
 
@@ -106,7 +106,7 @@ CFG = {
     "payout_ratio":                 0.3429,  # profit/stake = 0.12/0.35 (actual observed)
 
     # ── Signal ──
-    "warmup_ticks":       80,          # need 80 ticks to fill order-3 Markov table
+    "warmup_ticks":       800,          # need 80 ticks to fill order-3 Markov table
     "signal_interval":    1,           # evaluate every tick (1-tick contracts)
     "min_confidence":     0.74,        # ensemble gate (above 70% base rate)
     "markov_order":       3,           # use last 3 digits as state
@@ -145,8 +145,8 @@ CFG = {
 
     # ── Walk-Forward Validator ──
     "wfv_enabled":           True,
-    "wfv_is_size":           500,     # in-sample window (ticks)
-    "wfv_oos_size":          150,     # out-of-sample window (ticks)
+    "wfv_is_size":           800,     # in-sample window (ticks)
+    "wfv_oos_size":          750,     # out-of-sample window (ticks)
     "wfv_step":              150,     # advance per fold
     "wfv_decay_threshold":   0.08,    # IS→OOS WR drop triggers penalty
     "wfv_conf_penalty":      0.02,    # raise min_confidence by this on decay
@@ -156,7 +156,7 @@ CFG = {
     "wfv_eval_interval_s":   60,      # re-run WFV every N seconds
 
     # ── Learning Phase (Phase 1) ──
-    "learning_phase_seconds": 300,    # 5 minutes observation before live trading
+    "learning_phase_seconds": 1000,    # 5 minutes observation before live trading
 }
 
 # ── Regime-conditional ensemble weights ──
