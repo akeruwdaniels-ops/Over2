@@ -74,11 +74,11 @@ from scipy import stats
 # ══════════════════════════════════════════════════════════════════════════
 CFG = {
     # ── Contract ──
-    "underlying_symbol": "R_100",
+    "underlying_symbol": "1HZ100V",
     "contract_type":     "DIGITOVER",
     "barrier":           "2",          # win if last digit > 2  (digits 3-9)
     "currency":          "USD",
-    "duration":          1,
+    "duration":          5,
     "duration_unit":     "t",          # 1-tick contract
 
     # ── Capital ──
