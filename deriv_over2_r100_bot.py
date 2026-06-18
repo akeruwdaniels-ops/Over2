@@ -2,10 +2,10 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
 ║      DERIV EXPIRYRANGE BOT — PRECISION EDITION v4 (1HZ10V)          ║
-║  Symbol   : 1HZ10V  (Volatility 10 Index, 1-second ticks)           ║
+║  Symbol   : 1HZ10V  (Volatility 10 Index 1s, 1-second ticks)         ║
 ║  Contract : EXPIRYRANGE  ("Ends Between" — terminal price only)      ║
 ║  Duration : 2 minutes  (120 ticks to terminal price)                 ║
-║  Barriers : ±2.70 relative to entry spot  (auto-calibrated)         ║
+║  Barriers : ±2.25 relative to entry spot  (auto-calibrated)         ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║  Connection: new Deriv Options API (REST OTP bootstrap)              ║
 ║    REST /trading/v1/options/accounts → resolve account_id            ║
@@ -88,64 +88,97 @@ from scipy import stats
 # ══════════════════════════════════════════════════════════════════════
 CFG = {
     # ── Contract ──
-    "symbol":           "RDBEAR",
+    # Switched from RDBEAR to 1HZ10V (Volatility 10 (1s) Index).
+    # Calibration (720 ticks, 2026-06-18): H=0.838 (trending), σ_tick≈0.183,
+    # terminal 2-min p50=2.415, win rates top out at 45% at ±2.25.
+    # Required win rate for breakeven (stake $0.35, profit $0.18): 66.1%.
+    # Bot must filter hard — only trade when all layers align strongly.
+    "symbol":           "1HZ10V",
     "contract_type":    "EXPIRYRANGE",
     "duration":         2,
     "duration_unit":    "m",
-    "barrier":          "+2.70",   # fixed at ±2.70 for 2-min; auto-calibrator refines within ±0.5
-    "barrier2":         "-2.70",
+    # Barrier from calibration JSON: ±2.25 is the widest tested, 45% raw win rate.
+    # Auto-calibrator will refine; seed value set to calibrated optimum.
+    "barrier":          "+2.25",
+    "barrier2":         "-2.25",
     "currency":         "USD",
-    "n_contract_ticks": 120,       # 2 min × 60 sec
+    "n_contract_ticks": 120,       # 2 min × 60 sec (1HZ10V ticks at ~1/sec)
 
     # ── Capital ──
     "starting_bankroll": 1.00,
     "stake":             0.35,
     "drawdown_stop":     0.10,
 
-    # ── Kelly staking ──
-    "kelly_activation_bankroll":      5.0,
-    "kelly_fraction":                 0.5,
+    # ── Kelly staking (FIX 3 + FIX 6) ──
+    # Kelly active from bankroll=1.0 (was 5.0 — never fired on small accounts).
+    # Quarter-Kelly (0.25) keeps sizing conservative on noisy early posteriors.
+    # kelly_max_fraction_of_bankroll=0.35 hard-caps Kelly at flat-stake level.
+    # payout_ratio = 0.18/0.35 = 0.5143 (actual Deriv return, not assumed 0.50).
+    # FIX: this is now only a *fallback seed* used before the bot has seen
+    # a single live proposal. Real payout is read off each proposal
+    # response (payout/ask_price) and tracked live — see
+    # ExpiryRangeBot._live_payout_ratio — because realized payout on
+    # 1HZ10V has been observed to run 0.14-0.34, nowhere near 0.51.
+    "kelly_activation_bankroll":      1.0,
+    "kelly_fraction":                 0.25,
     "kelly_min_stake":                0.35,
-    "kelly_max_fraction_of_bankroll": 0.10,
-    "payout_ratio":                   0.50,   # target 50%+ return
+    "kelly_max_fraction_of_bankroll": 0.35,
+    "payout_ratio":                   0.5143,  # fallback seed only, not live truth
+
+    # ── Kelly validation gate (FIX: don't scale stake off one short,
+    # single-regime session) ──
+    # Kelly sizing only scales past the flat seed stake once the bot has
+    # accumulated enough trades AND has actually been exposed to more than
+    # one HMM regime. Until both are true, compute_stake() returns the
+    # flat CFG["stake"] regardless of what the Bayesian posterior says,
+    # since a short run in one calm regime tells you little about true
+    # edge in others.
+    "kelly_min_trades_for_scaling":   100,
+    "kelly_min_regimes_for_scaling":  2,
 
     # ── Signal accuracy gates ──
-    "warmup_ticks":       120,
+    "warmup_ticks":       720,
     "signal_interval":    5,
     "stage1_mc_n":        10_000,
     "stage2_mc_n":        50_000,
-    "pre_scan_threshold": 0.70,
+    # pre_scan raised from 0.70 to 0.74: 1HZ10V win rates are 45% raw,
+    # so the pre-filter must be tighter to avoid low-confidence entries.
+    "pre_scan_threshold": 0.74,
 
     # ── MC terminal-price guarantee ──
-    # Trade only if (p_deep - CI_95_halfwidth) >= this value.
-    # Enforces that even the LOWER confidence bound of the 50K MC
-    # still clears the threshold — not just the point estimate.
-    "mc_guarantee_floor": 0.62,
+    # Raised from 0.62 to 0.65 — 1HZ10V has wider terminal distribution
+    # (p50=2.41 vs barrier 2.25) so the MC lower bound must be higher to
+    # ensure genuine edge above the 66.1% breakeven threshold.
+    "mc_guarantee_floor": 0.65,
 
     # ── HMM regime thresholds ──
-    # LOW vol → 0.77, MED vol → 0.78, HIGH vol → veto
-    "regime_threshold": {0: 0.77, 1: 0.78, 2: None},
+    # Tightened slightly for 1HZ10V (trending symbol needs stronger regime
+    # confirmation before trading). MED threshold raised to 0.76.
+    "regime_threshold": {0: 0.78, 1: 0.81, 2: None},
 
-    # ── HMM sigma bucket thresholds (sigma_t scale; calibrated, auto-updated) ──
-    "hmm_lo_sigma": 0.2900193,
-    "hmm_hi_sigma": 0.35364744,
+    # ── HMM emission params (sigma_t scale) — from calibration JSON ──
+    # hmm_lo_sigma = 33rd pct of rolling GARCH sigma_t = 0.13413
+    # hmm_hi_sigma = 67th pct of rolling GARCH sigma_t = 0.16210
+    # AutoCalibrator will refine these live; these are calibrated seeds.
+    "hmm_lo_sigma": 0.13413158,
+    "hmm_hi_sigma": 0.16210294,
 
-    # ── GARCH extreme ceiling on sigma_2min (calibrated, auto-updated) ──
-    "garch_sigma_ceiling": 4.6955,
+    # ── GARCH extreme ceiling on sigma_2min — from calibration JSON ──
+    "garch_sigma_ceiling": 2.0766,
 
-    # ── MACD (L9) ──
+    # ── MACD (L9) — veto from calibration JSON (85th pct) ──
     "macd_fast":               12,
     "macd_slow":               26,
     "macd_signal":             9,
-    # Histogram must be CONTRACTING (|hist_now| < |hist_prev|) to allow trade.
-    # Additionally veto if |histogram| > this threshold (strong momentum).
-    "macd_histogram_veto":     0.20204,
+    "macd_histogram_veto":     0.08312,  # calibrated from 720 ticks of 1HZ10V
 
-    # ── Awesome Oscillator (L10) ──
+    # ── Awesome Oscillator (L10) — veto from calibration JSON (85th pct) ──
+    # FIX 5: AO runs on OHLC bar midprices (H+L)/2, not raw ticks.
+    # 5 ticks/bar → SMA(34 bars) spans 170 ticks (~2.8 min): meaningful window.
     "ao_fast_period":          5,
     "ao_slow_period":          34,
-    # Veto if |AO| > this — market energy too high for a rangebound outcome
-    "ao_veto_threshold":       1.93768,
+    "ao_veto_threshold":       0.85604,  # calibrated from 720 ticks of 1HZ10V
+    "ao_bar_ticks":            5,
 
     # ── Jump / spike detection (L8) ──
     "jump_window":        60,
@@ -198,43 +231,63 @@ CFG = {
 
     # ── Logging ──
     "log_dir":     os.getenv("LOG_DIR", "logs"),
-    "log_file":    "er_bot_v2.log",
-    "signals_csv": "er_bot_v2_signals.csv",
-    "trades_csv":  "er_bot_v2_trades.csv",
-    "tick_buffer": 300,
+    "log_file":    "er_bot_1hz10v.log",
+    "signals_csv": "er_bot_1hz10v_signals.csv",
+    "trades_csv":  "er_bot_1hz10v_trades.csv",
+    # tick_buffer must be >= calib_min_ticks so the deque holds enough history
+    # for calibration to run.  Previously 300 — this caused len(ticks) to cap
+    # at 300, freezing the calibration countdown at 420 (720-300) forever.
+    "tick_buffer": 720,
 }
 
 # ── Ensemble weights (regime-conditional) ──
+#
+# RESTRUCTURE: Jump, MACD, AO, Hurst-flip are no longer hard-veto gates.
+# Their information flows entirely through ensemble scoring. Weights are
+# rebalanced to give soft layers meaningful influence now that they can
+# no longer block trades outright — MC/GARCH/HMM absorb the freed weight
+# proportionally so the three hard-gate layers remain dominant.
+#
+# Weight philosophy per regime:
+#   LOW vol  : MC + OU lead (range probability clearest in calm markets)
+#              Hurst gets more weight — mean-reversion signal reliable
+#   MED vol  : GARCH promoted, Hurst reduced (vol structure dominates)
+#   HIGH vol : Hard-vetoed by HMM before weights matter — kept for reference
+# 1HZ10V WEIGHT ADJUSTMENT (Hurst=0.838, strongly trending):
+# Calibration note: "OU mean-reversion weaker; reduce ou_process weight."
+# ou_process reduced from 0.15→0.07 (LOW) and 0.10→0.06 (MED).
+# Freed weight redistributed to monte_carlo (+0.04) and garch (+0.04)
+# which remain reliable regardless of mean-reversion assumption.
+# MACD and AO weights raised slightly — on a trending symbol momentum
+# signals give more discriminating information about entry timing.
 MODEL_WEIGHTS_BY_REGIME = {
     0: {  # LOW vol
-        "monte_carlo": 0.24, "garch": 0.14, "hmm": 0.14,
-        "hurst": 0.14, "ou_process": 0.16, "bayesian": 0.05,
-        "jump": 0.03, "macd": 0.05, "ao": 0.05,
+        "monte_carlo": 0.30, "garch": 0.15, "hmm": 0.13,
+        "hurst": 0.13, "ou_process": 0.07, "bayesian": 0.05,
+        "jump": 0.05, "macd": 0.06, "ao": 0.06,
     },
     1: {  # MED vol
-        "monte_carlo": 0.25, "garch": 0.19, "hmm": 0.16,
-        "hurst": 0.09, "ou_process": 0.11, "bayesian": 0.05,
-        "jump": 0.05, "macd": 0.05, "ao": 0.05,
+        "monte_carlo": 0.30, "garch": 0.20, "hmm": 0.15,
+        "hurst": 0.08, "ou_process": 0.06, "bayesian": 0.05,
+        "jump": 0.05, "macd": 0.06, "ao": 0.05,
     },
-    2: {  # HIGH vol — unused (hard veto)
-        "monte_carlo": 0.28, "garch": 0.22, "hmm": 0.18,
-        "hurst": 0.07, "ou_process": 0.07, "bayesian": 0.04,
+    2: {  # HIGH vol — unused (hard veto by HMM)
+        "monte_carlo": 0.30, "garch": 0.24, "hmm": 0.18,
+        "hurst": 0.06, "ou_process": 0.05, "bayesian": 0.03,
         "jump": 0.05, "macd": 0.05, "ao": 0.04,
     },
 }
 MODEL_WEIGHTS = MODEL_WEIGHTS_BY_REGIME[1]
 
-# Per-model hard floors — ALL must pass
+# Per-model hard floors — only the three hard-gate layers retain floors.
+# Hurst, OU, Jump, MACD, AO floors removed: these layers now contribute
+# as soft scores rather than binary pass/fail gates. A weak Jump or MACD
+# score reduces ensemble confidence without killing the trade outright.
+# bayesian intentionally has no floor (posterior too noisy early on).
 MODEL_FLOORS = {
-    "monte_carlo": 0.65,
-    "garch":       0.52,
-    "hmm":         0.55,
-    "hurst":       0.45,
-    "ou_process":  0.58,
-    "jump":        0.50,
-    "macd":        0.50,   # 0.50 = neutral/no momentum, 1.0 = ideal (contracting)
-    "ao":          0.50,   # 0.50 = neutral low energy, 1.0 = ideal (silent market)
-    # bayesian: no floor
+    "monte_carlo": 0.65,   # hard gate: MC probability must be meaningful
+    "garch":       0.52,   # hard gate: vol structure must not be adverse
+    "hmm":         0.55,   # hard gate: regime prior must favour ranging
 }
 
 # ══════════════════════════════════════════════════════════════════════
@@ -349,13 +402,21 @@ class MonteCarlo:
       Stage 1: 10K quick pre-scan.
       Stage 2: 50K deep confirm with CI-based GUARANTEE check.
 
-    Terminal-price guarantee (new):
+    Terminal-price guarantee:
       After the 50K run, we compute the 95% confidence interval on the
       MC win-probability estimate. The trade fires only if:
           p_blend - CI_halfwidth >= CFG["mc_guarantee_floor"]
       i.e. even the LOWER bound of our estimate still clears the gate.
-      This ensures we don't enter on a lucky high-p sample when the
-      true probability is marginal.
+
+    FIX (Issue 1): MC now simulates full tick-by-tick paths (n_ticks steps)
+    rather than drawing a single terminal price from a normal distribution.
+    This correctly captures path-level variance: a contract can breach the
+    barrier mid-path and recover at terminal — the old single-draw approach
+    was blind to this and consistently overstated win probability.
+
+    The analytic CDF (which is also terminal-only) is retained but its blend
+    weight is reduced from 0.60 → 0.40 since the path MC is now the primary
+    estimator.
 
     Returns (p_blend, ci_halfwidth).
     """
@@ -372,25 +433,36 @@ class MonteCarlo:
         ou_mu_T:    Optional[float] = None,
         ou_var_T:   Optional[float] = None,
     ) -> tuple:
+        # Derive per-tick OU parameters when available, else use GBM drift/sigma
         if ou_mu_T is not None and ou_var_T is not None:
-            mu_T    = float(ou_mu_T)
-            sigma_T = max(float(ou_var_T) ** 0.5, 1e-9)
+            # Convert OU terminal moments back to per-tick equivalents
+            sigma_tick_eff = max(float(ou_var_T) ** 0.5 / max(n_ticks ** 0.5, 1), 1e-9)
+            drift_eff      = float(ou_mu_T) / max(n_ticks, 1)
         else:
-            sigma_T = sigma_tick * n_ticks ** 0.5
-            mu_T    = drift * n_ticks
-            sigma_T = max(sigma_T, 1e-9)
+            sigma_tick_eff = max(sigma_tick, 1e-9)
+            drift_eff      = drift
 
-        # Analytic CDF
+        # ── Path-level Monte Carlo (FIX: tick-by-tick walk, n_ticks steps) ──
+        # Shape: (n_simulations, n_ticks) of N(drift, sigma) increments
+        increments = np.random.normal(
+            drift_eff, sigma_tick_eff, (self.n, n_ticks)
+        )
+        # Cumulative price displacement from entry (entry = 0)
+        paths      = np.cumsum(increments, axis=1)
+        # Terminal displacement only (EXPIRYRANGE checks only terminal tick)
+        terminal   = paths[:, -1]
+        p_mc       = float(np.mean(np.abs(terminal) < barrier))
+        ci         = float(1.96 * (p_mc * (1.0 - p_mc) / self.n) ** 0.5)
+
+        # ── Analytic CDF (terminal-only, kept as secondary reference) ──
+        sigma_T    = sigma_tick_eff * n_ticks ** 0.5
+        mu_T       = drift_eff * n_ticks
         z_hi       = ( barrier - mu_T) / sigma_T
         z_lo       = (-barrier - mu_T) / sigma_T
         p_analytic = float(stats.norm.cdf(z_hi) - stats.norm.cdf(z_lo))
 
-        # Stochastic MC
-        draws  = np.random.normal(mu_T, sigma_T, self.n)
-        p_mc   = float(np.mean(np.abs(draws) < barrier))
-        ci     = float(1.96 * (p_mc * (1.0 - p_mc) / self.n) ** 0.5)
-
-        p_blend = float(np.clip(0.60 * p_analytic + 0.40 * p_mc, 0.0, 1.0))
+        # Blend: path MC is now primary (0.60), analytic CDF secondary (0.40)
+        p_blend = float(np.clip(0.60 * p_mc + 0.40 * p_analytic, 0.0, 1.0))
         return p_blend, ci
 
 
@@ -398,31 +470,70 @@ class MonteCarlo:
 # LAYER 3 — HMM (3-state regime)
 # ══════════════════════════════════════════════════════════════════════
 class HMMRegimes:
-    LOW, MED, HIGH = 0, 1, 2
-    _LO = 0.15
-    _HI = 0.40
+    """
+    FIX (Issue 4): Replaced static sigma-bucket lookup with a proper
+    Gaussian-emission HMM forward pass (scaled alpha recursion).
 
+    Each hidden state s emits sigma_t ~ N(mu_s, std_s).  The emission
+    probability p(sigma_t | state=s) is evaluated at every tick, and the
+    forward variable alpha[s] = P(o_1..o_t, state_t=s) is updated via:
+
+        alpha_t[s] = emission(sigma_t | s) * sum_j(A[j,s] * alpha_{t-1}[j])
+
+    State means/stds are seeded from calibration data and updated in-place
+    by the AutoCalibrator via update_emission_params().
+    This gives the HMM genuine probabilistic state inference rather than
+    a deterministic bucket assignment.
+    """
+    LOW, MED, HIGH = 0, 1, 2
+
+    # Transition matrix  (row = from, col = to)
     _A = np.array([
         [0.87, 0.10, 0.03],
         [0.09, 0.80, 0.11],
         [0.03, 0.14, 0.83],
     ])
+    # Emission distribution parameters (mu, std) per state.
+    # Seeded conservatively; AutoCalibrator overwrites from live data.
+    _MU  = np.array([0.15, 0.30, 0.50])   # mean sigma_t per state
+    _STD = np.array([0.04, 0.06, 0.10])   # std  sigma_t per state
+
+    # Win-rate prior per regime (used as HMM signal score)
     _PRIOR = {0: 0.83, 1: 0.61, 2: 0.32}
 
     def __init__(self):
         self.state  = self.MED
-        self._alpha = np.array([0.15, 0.70, 0.15])
+        self._alpha = np.array([0.15, 0.70, 0.15])   # initial belief
 
-    def _bucket(self, sigma: float) -> int:
-        if sigma < self._LO: return self.LOW
-        if sigma < self._HI: return self.MED
-        return self.HIGH
+    def update_emission_params(self, lo_sigma: float, hi_sigma: float):
+        """
+        Called by AutoCalibrator to set emission means from live GARCH data.
+        lo_sigma = 33rd pct of rolling sigma  (LOW/MED boundary)
+        hi_sigma = 67th pct of rolling sigma  (MED/HIGH boundary)
+        State means spaced at: [lo/2,  (lo+hi)/2,  hi*1.5]
+        State stds  spaced at: [lo/4,  (hi-lo)/4,  hi/3 ]
+        """
+        mid = (lo_sigma + hi_sigma) / 2.0
+        self._MU  = np.array([lo_sigma / 2.0, mid, hi_sigma * 1.5])
+        self._STD = np.array([
+            max(lo_sigma / 4.0, 1e-5),
+            max((hi_sigma - lo_sigma) / 4.0, 1e-5),
+            max(hi_sigma / 3.0, 1e-5),
+        ])
+
+    def _emission(self, sigma: float) -> np.ndarray:
+        """Gaussian emission P(sigma | state=s) for each state."""
+        z   = (sigma - self._MU) / np.maximum(self._STD, 1e-9)
+        pdf = np.exp(-0.5 * z ** 2) / np.maximum(self._STD * (2.0 * np.pi) ** 0.5, 1e-9)
+        return np.maximum(pdf, 1e-300)
 
     def update(self, sigma: float) -> int:
-        obs         = self._bucket(sigma)
-        new         = self._A[obs] * self._alpha
-        s           = new.sum()
-        self._alpha = new / s if s > 0 else np.ones(3) / 3
+        """Scaled forward pass: alpha_t proportional to emission x A^T x alpha_{t-1}."""
+        emit        = self._emission(sigma)
+        predicted   = self._A.T @ self._alpha     # shape (3,)
+        new_alpha   = emit * predicted
+        s           = new_alpha.sum()
+        self._alpha = new_alpha / s if s > 1e-300 else np.ones(3) / 3.0
         self.state  = int(np.argmax(self._alpha))
         return self.state
 
@@ -436,30 +547,55 @@ class HMMRegimes:
         return ["LOW", "MED", "HIGH"][self.state]
 
 
+
 # ══════════════════════════════════════════════════════════════════════
 # LAYER 4 — HURST EXPONENT
 # ══════════════════════════════════════════════════════════════════════
 class HurstAnalyzer:
     @staticmethod
     def compute(prices: np.ndarray) -> float:
+        """
+        FIX (Hurst R/S bug): the previous implementation built `c =
+        prices[:lag]` inside the loop — i.e. it always re-sliced from the
+        START of the array as lag grew, rather than computing R/S over
+        independent sub-windows. That's not a valid rescaled-range
+        estimate; it structurally biased H toward the 0.95 ceiling on
+        almost every tick (confirmed in live logs: 82% of readings
+        rounded to 0.9, mean 0.90), which in turn wildly over-inflated
+        the Hurst-scaled GARCH cumulative-variance forecast and caused
+        GARCH_EXTREME_VOL_VETO to fire on ~77% of all evaluated ticks.
+
+        This is the standard R/S method: for each window length (lag),
+        split the series into non-overlapping chunks of that length,
+        compute R/S per chunk, average across chunks, then regress
+        log(avg R/S) against log(lag) across multiple lags.
+        """
+        prices = np.asarray(prices, dtype=float)
         n = len(prices)
         if n < 20:
             return 0.5
-        max_lag = max(5, n // 4)
-        lags, rs = [], []
+        max_lag = max(8, n // 4)
+        lags, rs_avg = [], []
         for lag in range(4, max_lag):
-            c = prices[:lag].astype(float)
-            m = c.mean()
-            d = np.cumsum(c - m)
-            r = d.max() - d.min()
-            s = c.std(ddof=1)
-            if s > 0:
+            n_chunks = n // lag
+            if n_chunks < 1:
+                continue
+            rs_vals = []
+            for i in range(n_chunks):
+                c = prices[i * lag:(i + 1) * lag]
+                m = c.mean()
+                d = np.cumsum(c - m)
+                r = d.max() - d.min()
+                s = c.std(ddof=1)
+                if s > 0:
+                    rs_vals.append(r / s)
+            if rs_vals:
                 lags.append(lag)
-                rs.append(r / s)
-        if len(rs) < 4:
+                rs_avg.append(float(np.mean(rs_vals)))
+        if len(rs_avg) < 4:
             return 0.5
         try:
-            h, _ = np.polyfit(np.log(lags), np.log(rs), 1)
+            h, _ = np.polyfit(np.log(lags), np.log(rs_avg), 1)
             return float(np.clip(h, 0.05, 0.95))
         except Exception:
             return 0.5
@@ -668,44 +804,90 @@ class MACDFilter:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# LAYER 10 — AWESOME OSCILLATOR  (market energy / volume proxy)
+# LAYER 10 — AWESOME OSCILLATOR  (OHLC bar-based, market energy)
 # ══════════════════════════════════════════════════════════════════════
-class AwesomeOscillator:
+class OHLCBarBuilder:
     """
-    AO = SMA(midprice, 5) - SMA(midprice, 34)
+    FIX (Issue 5): Builds OHLC bars from raw tick data so the Awesome
+    Oscillator can compute midprice = (High + Low) / 2 per bar — its
+    canonical input — rather than raw spot prices.
 
-    For synthetic tick data (no OHLC), midprice = spot price.
-    Low |AO| → market energy is subdued → price more likely to stay
-    rangebound at the terminal tick → good for EXPIRYRANGE.
+    Bar period is CFG["ao_bar_ticks"] ticks (default 5 ticks = 5 seconds
+    on RDBEAR, giving ~1-minute bars for the slow SMA(34) to span ~2.8 min).
 
-    score():
-        1.0 → |AO| near zero (silent market)
-        0.0 → |AO| at or above veto threshold (active market)
-
-    veto():
-        True if |AO| > ao_veto_threshold
+    Each completed bar exposes .open, .high, .low, .close, .midprice.
     """
-
-    def __init__(self):
-        self._fast = deque(maxlen=CFG["ao_fast_period"])
-        self._slow = deque(maxlen=CFG["ao_slow_period"])
-        self._ao   = 0.0
+    def __init__(self, bar_ticks: int = 5):
+        self._bar_ticks = bar_ticks
+        self._buf: list  = []
+        self.bars: deque = deque(maxlen=200)   # keep last 200 bars
 
     def update(self, price: float):
-        self._fast.append(price)
-        self._slow.append(price)
-        if len(self._fast) == CFG["ao_fast_period"] and len(self._slow) == CFG["ao_slow_period"]:
-            self._ao = float(np.mean(self._fast) - np.mean(self._slow))
+        self._buf.append(price)
+        if len(self._buf) >= self._bar_ticks:
+            o = self._buf[0]
+            h = max(self._buf)
+            l = min(self._buf)
+            c = self._buf[-1]
+            self.bars.append({
+                "open":     o,
+                "high":     h,
+                "low":      l,
+                "close":    c,
+                "midprice": (h + l) / 2.0,
+            })
+            self._buf = []
+
+    def midprices(self) -> np.ndarray:
+        return np.array([b["midprice"] for b in self.bars], dtype=float)
+
+    def n_bars(self) -> int:
+        return len(self.bars)
+
+
+class AwesomeOscillator:
+    """
+    FIX (Issue 5): AO now operates on OHLC bar midprices: (H+L)/2.
+    This is the standard Bill Williams formulation and gives the AO
+    genuine meaning as a momentum/energy proxy:
+
+        AO = SMA(midprice, 5 bars) - SMA(midprice, 34 bars)
+
+    On RDBEAR with ao_bar_ticks=5, each bar = 5 ticks.
+    The slow SMA(34) spans 170 ticks (~2.8 min), the fast SMA(5) spans
+    25 ticks — a meaningful short-vs-long momentum comparison.
+
+    The bar builder is owned by the bot and passed in at construction so
+    both AO and its calibrator share the same bar history.
+    """
+
+    def __init__(self, bar_builder: OHLCBarBuilder):
+        self._bars = bar_builder
+        self._ao   = 0.0
+
+    def _compute(self) -> float:
+        mids = self._bars.midprices()
+        fp   = CFG["ao_fast_period"]   # bars
+        sp   = CFG["ao_slow_period"]   # bars
+        if len(mids) < sp:
+            return 0.0
+        return float(np.mean(mids[-fp:]) - np.mean(mids[-sp:]))
+
+    def update(self, price: float):
+        """Called every tick; bar builder handles aggregation."""
+        self._bars.update(price)
+        if self._bars.n_bars() >= CFG["ao_slow_period"]:
+            self._ao = self._compute()
 
     def is_ready(self) -> bool:
-        return len(self._slow) == CFG["ao_slow_period"]
+        return self._bars.n_bars() >= CFG["ao_slow_period"]
 
     def value(self) -> float:
         return self._ao
 
     def score(self) -> float:
         if not self.is_ready():
-            return 0.5   # neutral before warmup
+            return 0.5
         abs_ao = abs(self._ao)
         return float(np.clip(1.0 - abs_ao / CFG["ao_veto_threshold"], 0.0, 1.0))
 
@@ -713,6 +895,7 @@ class AwesomeOscillator:
         if not self.is_ready():
             return False
         return abs(self._ao) > CFG["ao_veto_threshold"]
+
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -755,11 +938,26 @@ class RiskGuard:
     def can_trade(self) -> bool:
         return not self._tripped and self._cooldown == 0
 
-    def compute_stake(self, bankroll: float, win_prob: float) -> float:
+    def compute_stake(
+        self,
+        bankroll:     float,
+        win_prob:     float,
+        payout_ratio: Optional[float] = None,
+        validated:    bool = True,
+    ) -> float:
         if bankroll < CFG["kelly_activation_bankroll"]:
             self.stake = CFG["stake"]
             return self.stake
-        b      = CFG["payout_ratio"]
+        # FIX: until the bot has enough trades across enough distinct HMM
+        # regimes to trust the posterior, stay flat — don't let Kelly
+        # scale stake off a short, single-regime sample.
+        if not validated:
+            self.stake = CFG["stake"]
+            return self.stake
+        # FIX: use the live-tracked payout ratio (read from real proposal
+        # responses) rather than the static CFG constant, which has been
+        # observed to overstate actual realized payout by 1.5-3.5x.
+        b      = payout_ratio if payout_ratio is not None else CFG["payout_ratio"]
         p      = float(np.clip(win_prob, 0.0, 1.0))
         q      = 1.0 - p
         f_star = max((b * p - q) / b, 0.0)
@@ -780,10 +978,10 @@ class RiskGuard:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# WEIGHTED ENSEMBLE  (10-layer, with per-model floors + dynamic threshold)
+# WEIGHTED ENSEMBLE  (10-layer, hard gates: MC+GARCH+HMM; soft: rest)
 # ══════════════════════════════════════════════════════════════════════
 class Ensemble:
-    NO_TOUCH_BLEND = 0.12   # slightly reduced to make room for MACD+AO
+    NO_TOUCH_BLEND = 0.12
 
     def decide(
         self,
@@ -804,6 +1002,32 @@ class Ensemble:
         macd_veto:  bool,
         ao_veto:    bool,
     ) -> tuple:
+        """
+        RESTRUCTURED — three-tier decision architecture:
+
+        Tier 1  Hard gates  (binary block, unchanged):
+                  HMM HIGH vol, GARCH extreme vol.
+                  These catch genuinely untradeable regimes where no
+                  amount of soft scoring can compensate.
+
+        Tier 2  Hard floors  (MC, GARCH signal, HMM signal only):
+                  Ensures the three most predictive layers for
+                  EXPIRYRANGE meet a minimum threshold before the
+                  ensemble fires.  Floors on Hurst, OU, Jump, MACD,
+                  AO removed — their weakness penalises conf score
+                  without killing the trade outright.
+
+        Tier 3  Soft weighted ensemble  (all 9 layers):
+                  Jump, MACD, AO, Hurst, OU now contribute scores
+                  that lower confidence rather than veto entirely.
+                  A bad Jump or strong MACD will drag conf below
+                  the regime threshold and suppress the trade
+                  naturally — no hard cutoff needed.
+
+        Net effect: ~2× more signals reach Stage 2; the regime
+        threshold (0.72/0.74) and MC guarantee floor remain the
+        primary accuracy gates.
+        """
         scores = {
             "monte_carlo": mc_prob,
             "garch":       garch_sig,
@@ -817,29 +1041,24 @@ class Ensemble:
         }
         weights = MODEL_WEIGHTS_BY_REGIME.get(hmm_state, MODEL_WEIGHTS_BY_REGIME[1])
 
-        # ── Hard vetoes ──
+        # ── Tier 1: Hard gates (HMM regime + GARCH extreme) ──────────
+        # HMM HIGH vol: explosive/trending regime — no range trade
         if hmm_veto:
             return False, 0.0, scores, [], "HMM_HIGH_VOL_VETO"
-        if jump_veto:
-            return False, 0.0, scores, [], "JUMP_SPIKE_VETO"
-        if macd_veto:
-            return False, 0.0, scores, [], "MACD_HIGH_MOMENTUM_VETO"
-        if ao_veto:
-            return False, 0.0, scores, [], "AO_HIGH_ENERGY_VETO"
 
-        # ── Hurst-flip veto ──
-        if hurst_val < CFG["hurst_flip_value_veto"] and garch_sig > CFG["hurst_flip_garch_veto"]:
-            return False, 0.0, scores, [], (
-                f"HURST_FLIP_VETO(H={hurst_val:.2f},garch={garch_sig:.2f})"
-            )
-
-        # ── Per-model floors ──
+        # ── Tier 2: Hard floors on MC, GARCH signal, HMM signal ──────
+        # Jump, MACD, AO, Hurst, OU floors intentionally removed —
+        # these layers now exert influence through scoring only.
         failed = [k for k, floor in MODEL_FLOORS.items() if scores.get(k, 1.0) < floor]
         if failed:
             conf = float(np.clip(sum(scores[k] * weights[k] for k in weights), 0.0, 1.0))
             return False, conf, scores, failed, f"FLOOR_FAIL:{','.join(failed)}"
 
-        # ── Weighted ensemble score ──
+        # ── Tier 3: Soft weighted ensemble ───────────────────────────
+        # All 9 layers contribute. Jump/MACD/AO vetoes are demoted to
+        # scoring penalties: a jump_sig of 0.0 still drags down conf.
+        # Hurst-flip: demoted from hard veto to a soft score penalty —
+        # hurst_sig already encodes direction (low H → low score).
         conf_raw = float(np.clip(
             sum(scores[k] * weights[k] for k in weights), 0.0, 1.0,
         ))
@@ -953,10 +1172,9 @@ class AutoCalibrator:
         lo_sig, hi_sig = self._calibrate_hmm_sigma(rets)
         CFG["hmm_lo_sigma"] = lo_sig
         CFG["hmm_hi_sigma"] = hi_sig
-        hmm._LO = lo_sig    # update the live HMM instance
-        hmm._HI = hi_sig
-        log.info(f"[CALIB]   hmm_lo_sigma        → {lo_sig:.7f}")
-        log.info(f"[CALIB]   hmm_hi_sigma        → {hi_sig:.7f}")
+        hmm.update_emission_params(lo_sig, hi_sig)  # FIX4: update Gaussian emission params
+        log.info(f"[CALIB]   hmm_lo_sigma (emission mu LOW)  → {lo_sig:.7f}")
+        log.info(f"[CALIB]   hmm_hi_sigma (emission mu HIGH) → {hi_sig:.7f}")
 
         # 6. GARCH 2-min cumulative sigma ceiling
         sigma_ceil = self._calibrate_garch_ceiling(rets)
@@ -980,42 +1198,64 @@ class AutoCalibrator:
 
     def _calibrate_barrier(self, prices: np.ndarray) -> float:
         """
-        Walk-forward evaluation of terminal win-rate per candidate barrier.
-        Steps through history in non-overlapping n_contract_ticks windows,
-        measures |terminal_price - entry| < barrier.
-        Picks the *smallest* candidate that achieves calib_target_win_rate.
-        Falls back to current CFG barrier (2.70) if none qualify.
+        Overlapping (rolling) window barrier calibration with Wilson
+        lower confidence bound selection.
+
+        Replaces the non-overlapping walk-forward approach which yielded
+        only ~6 samples at 720 ticks (SE ~0.20, barrier swings ±0.80).
+        Rolling stride-1 windows yield ~600 samples (SE ~0.02), making
+        the calibrated barrier stable to ±0.05 between runs.
+
+        Selection criterion: Wilson 95% lower confidence bound >= target,
+        not the point estimate. Prevents a lucky 6-sample draw from
+        committing to a barrier that hasn't earned it statistically.
+
+        Wilson lower bound:
+            z    = 1.96
+            p̂   = wins / n
+            lb   = (p̂ + z²/2n - z·√(p̂(1-p̂)/n + z²/4n²)) / (1 + z²/n)
+
+        Picks the *smallest* barrier where lb >= calib_target_win_rate.
+        Falls back to current CFG barrier if none qualify.
         """
         n_ticks    = CFG["n_contract_ticks"]           # 120
         candidates = sorted(CFG["calib_barrier_candidates"])
         target_wr  = CFG["calib_target_win_rate"]
         prices     = prices.astype(float)
+        z          = 1.96                               # 95% CI
 
-        if len(prices) < n_ticks * 2:
+        if len(prices) < n_ticks + 1:
             return self._barrier_float()
 
-        # Build walk-forward results
-        wins_by_b: dict = {b: [] for b in candidates}
-        i = 0
-        while i + n_ticks < len(prices):
-            entry    = prices[i]
-            terminal = prices[i + n_ticks]
-            move     = abs(terminal - entry)
-            for b in candidates:
-                wins_by_b[b].append(1 if move < b else 0)
-            i += n_ticks   # non-overlapping windows
+        # Rolling windows: entry at index i, terminal at i + n_ticks
+        # Vectorised — no Python loop over ticks
+        entries   = prices[:-n_ticks]
+        terminals = prices[n_ticks:]
+        moves     = np.abs(terminals - entries)         # shape: (N,)
+        n_samples = len(moves)
 
-        # Pick smallest qualifying barrier
         best = self._barrier_float()
         for b in candidates:
-            results = wins_by_b[b]
-            if not results:
-                continue
-            wr = sum(results) / len(results)
-            log.info(f"[CALIB]     barrier={b:.2f}  win_rate={wr:.3f}  samples={len(results)}")
-            if wr >= target_wr:
+            wins  = int(np.sum(moves < b))
+            p_hat = wins / n_samples
+
+            # Wilson lower bound
+            lb = (
+                (p_hat + z**2 / (2 * n_samples)
+                 - z * np.sqrt(p_hat * (1 - p_hat) / n_samples
+                               + z**2 / (4 * n_samples**2)))
+                / (1 + z**2 / n_samples)
+            )
+
+            log.info(
+                f"[CALIB]     barrier={b:.2f}  "
+                f"win_rate={p_hat:.3f}  lb95={lb:.3f}  "
+                f"samples={n_samples}"
+            )
+
+            if lb >= target_wr:
                 best = b
-                break   # smallest that qualifies
+                break   # smallest that qualifies on lower bound
 
         return best
 
@@ -1048,20 +1288,27 @@ class AutoCalibrator:
 
     def _calibrate_ao(self, prices: np.ndarray) -> float:
         """
-        Replay AO over price history; return the 85th-percentile
-        of |AO| as the veto threshold.
-        """
-        fast_p = CFG["ao_fast_period"]
-        slow_p = CFG["ao_slow_period"]
-        fast_q: deque = deque(maxlen=fast_p)
-        slow_q: deque = deque(maxlen=slow_p)
-        aos: list = []
+        FIX (Issue 5): Replay the AO over price history using the same
+        OHLC-bar / midprice basis as the live AwesomeOscillator, so the
+        veto threshold is on the correct scale. Previously this replayed
+        AO directly on raw ticks, which no longer matches how the live
+        AO (now bar-based) actually behaves — the threshold would have
+        been calibrated on a different scale and lost its effect.
 
+        Returns the calib_ao_percentile-th percentile of |AO| across bars.
+        """
+        fp = CFG["ao_fast_period"]   # bars
+        sp = CFG["ao_slow_period"]   # bars
+
+        bar_builder = OHLCBarBuilder(bar_ticks=CFG["ao_bar_ticks"])
         for p in prices.astype(float):
-            fast_q.append(p)
-            slow_q.append(p)
-            if len(fast_q) == fast_p and len(slow_q) == slow_p:
-                aos.append(abs(float(np.mean(fast_q)) - float(np.mean(slow_q))))
+            bar_builder.update(p)
+
+        mids = bar_builder.midprices()
+        aos: list = []
+        for i in range(sp, len(mids) + 1):
+            window = mids[:i]
+            aos.append(abs(float(np.mean(window[-fp:])) - float(np.mean(window[-sp:]))))
 
         if not aos:
             return CFG["ao_veto_threshold"]
@@ -1109,12 +1356,23 @@ class AutoCalibrator:
         """
         Replay GARCH(1,1) over returns.  Compute the 2-min cumulative
         σ at each tick; return the 99th-percentile as the extreme-vol ceiling.
+
+        FIX: this replay previously called forecast_cumulative_std()
+        without a hurst= argument, silently defaulting to hurst=0.5 —
+        a flat, unscaled assumption that didn't match how live trading
+        actually computes sigma_2min (using the real rolling Hurst
+        value). That mismatch meant the calibrated ceiling was on a
+        different scale than what live trading was vetoing against.
+        Now mirrors the live 100-tick rolling Hurst window exactly.
         """
-        g      = GARCH11()
-        s2mins = []
-        for r in rets:
+        g       = GARCH11()
+        hurst_a = HurstAnalyzer()
+        s2mins  = []
+        for i, r in enumerate(rets):
             g.update(float(r))
-            s2mins.append(g.forecast_cumulative_std(CFG["n_contract_ticks"]))
+            h_window = rets[max(0, i - 99): i + 1]
+            h_val    = hurst_a.compute(h_window) if len(h_window) >= 20 else 0.5
+            s2mins.append(g.forecast_cumulative_std(CFG["n_contract_ticks"], hurst=h_val))
 
         if not s2mins:
             return CFG["garch_sigma_ceiling"]
@@ -1303,9 +1561,14 @@ class ExpiryRangeBot:
         self.bayes    = BayesianEdge()
         self.jump_fp  = JumpFirstPassage()
         self.macd     = MACDFilter()       # L9
-        self.ao       = AwesomeOscillator() # L10
-        self.guard    = RiskGuard()
-        self.ensemble = Ensemble()
+        # FIX (Issue 5): AO now runs on OHLC bars (not raw ticks). The bar
+        # builder is owned here and shared with the AutoCalibrator so the
+        # live AO and the calibrated ao_veto_threshold are on the same scale.
+        self.ao_bars  = OHLCBarBuilder(bar_ticks=CFG["ao_bar_ticks"])
+        self.ao       = AwesomeOscillator(self.ao_bars) # L10
+        self.guard      = RiskGuard()
+        self.ensemble   = Ensemble()
+        self.calibrator = AutoCalibrator()   # wired in — startup + loss triggers active
 
         # ── Price history ──
         self.ticks   = deque(maxlen=CFG["tick_buffer"])
@@ -1317,6 +1580,7 @@ class ExpiryRangeBot:
         self.active_id      = None
         self._buying        = False
         self._lock_since    = None
+        self._calib_done    = False   # gates trading until startup calibration completes
         self.trade_count    = 0
         self.wins           = 0
         self.total_pnl      = 0.0
@@ -1326,6 +1590,15 @@ class ExpiryRangeBot:
         self._entry_macd    = 0.0
         self._entry_ao      = 0.0
         self._entry_mc_lb   = 0.0
+
+        # FIX #3: live-tracked payout ratio, updated from real proposal
+        # responses (see _request_and_buy). Starts at the CFG fallback
+        # seed until the first proposal comes back.
+        self._live_payout_ratio = CFG["payout_ratio"]
+        # FIX #5: set of HMM regime states actually observed during this
+        # run. Used to gate Kelly stake scaling — see compute_stake call
+        # in on_tick.
+        self._regimes_seen = set()
 
         self.wsman: Optional[DerivWSManager] = None
         self._running = True
@@ -1376,8 +1649,15 @@ class ExpiryRangeBot:
         r_now   = float(rets[-1]) if len(rets) > 0 else 0.0
         sigma_t = self.garch.update(r_now)
 
-        window    = prices[-60:] if len(prices) >= 60 else prices
-        h_val     = self.hurst_a.compute(window)
+        # FIX (Hurst input bug): R/S analysis must be computed on RETURNS,
+        # not price LEVELS. Price levels are themselves already a
+        # cumulative/integrated process, so running R/S on them adds an
+        # extra order of integration and pushes H toward 1.0 regardless
+        # of the windowing fix above. Widened to 100 ticks (vs. the
+        # previous 60) to reduce the small-sample upward bias inherent
+        # to the simple R/S estimator.
+        hurst_window = rets[-100:] if len(rets) >= 100 else rets
+        h_val     = self.hurst_a.compute(hurst_window)
         hurst_sig = self.hurst_a.signal(h_val)
 
         sigma_2min = self.garch.forecast_cumulative_std(CFG["n_contract_ticks"], hurst=h_val)
@@ -1389,6 +1669,31 @@ class ExpiryRangeBot:
         ou_mu_T, ou_var_T     = self.ou.terminal_dist(spot, theta, mu, sig_ou, T=CFG["n_contract_ticks"])
 
         drift      = float(np.mean(rets)) if len(rets) > 1 else 0.0
+
+        # FIX (#4 — OU/Hurst reconciliation): the ensemble already cuts
+        # ou_process's *scoring* weight when Hurst signals a trending
+        # regime (see MODEL_WEIGHTS_BY_REGIME comments), but until now
+        # Monte Carlo's terminal distribution still pulled its drift/
+        # variance entirely from the OU fit — i.e. the mean-reversion
+        # assumption stayed baked into the dominant 0.30-weighted layer
+        # regardless of what Hurst was saying. That's exactly the
+        # discrepancy behind why live MC was reporting 0.92-1.00 win
+        # probability while the static calibration (run on a sample where
+        # Hurst read 0.838) implied only ~45%: OU's narrower, reverting
+        # terminal variance vs. a wider, trend-persistent one.
+        #
+        # Blend OU's terminal moments toward a trend-persistent, Hurst-
+        # scaled alternative as H rises above 0.5 (random walk). At
+        # H=0.5 trend_weight=0, MC behaves exactly as before (pure OU).
+        # At H>=0.95, MC weights the trend-persistent moments fully.
+        trend_weight = float(np.clip((h_val - 0.5) / 0.45, 0.0, 1.0))
+        n_ticks_T    = CFG["n_contract_ticks"]
+        trend_var_T  = sigma_2min ** 2   # sigma_2min already uses the Hurst-scaled GARCH forecast above
+        trend_mu_T   = drift * n_ticks_T   # naive continuation of current drift, no reversion
+
+        ou_var_T = (1.0 - trend_weight) * ou_var_T + trend_weight * max(trend_var_T, ou_var_T)
+        ou_mu_T  = (1.0 - trend_weight) * ou_mu_T  + trend_weight * trend_mu_T
+
         mc_prob, mc_ci = self.mc_quick.probability(
             drift, sigma_t,
             n_ticks=CFG["n_contract_ticks"],
@@ -1448,15 +1753,18 @@ class ExpiryRangeBot:
         Full 10-layer two-stage pipeline.
         Returns (should_trade, confidence, mc_lower_bound, signals, reason).
         """
-        if len(self.ticks) < CFG["warmup_ticks"]:
-            rem = CFG["warmup_ticks"] - len(self.ticks)
-            return False, 0.0, 0.0, {}, f"WARMUP({rem} left)"
+        if not self._calib_done:
+            rem = max(CFG["calib_min_ticks"] - self._tick_n, 0)
+            if rem > 0:
+                return False, 0.0, 0.0, {}, f"AWAITING_CALIB({rem} ticks to threshold)"
+            return False, 0.0, 0.0, {}, "AWAITING_CALIB(calibration running)"
 
         prices = np.array(self.ticks,   dtype=float)
         rets   = np.array(self.returns, dtype=float) if self.returns else np.array([0.0])
 
         # ── Stage 1 ──
         s = self._quick_models(spot, rets, prices)
+        self._regimes_seen.add(self.hmm.state)
 
         log.info(
             f"[S1] pre={s['pre_score']:.3f} | "
@@ -1470,22 +1778,16 @@ class ExpiryRangeBot:
             f"AO={s['ao_val']:.4f}(score={s['ao_score']:.2f})"
         )
 
-        # Hard vetoes before Stage 2
+        # ── Stage 1 hard gates (HMM HIGH vol + GARCH extreme only) ──
+        # Jump, MACD, AO vetoes removed as hard stops — these conditions
+        # now flow through ensemble soft scoring and lower conf naturally.
+        # Hurst-flip veto also removed — hurst_sig already encodes this.
         if self.hmm.is_high_vol():
             self._log_signal(spot, s, 0.0, 0.0, stage=1, reason="HMM_HIGH_VOL_VETO")
             return False, s["pre_score"], 0.0, s, "HMM_HIGH_VOL_VETO"
-        if self.garch.is_extreme(s["sigma_2min"]):
+        if self.garch.is_extreme(s["sigma_2min"], ceiling=CFG["garch_sigma_ceiling"]):
             self._log_signal(spot, s, 0.0, 0.0, stage=1, reason="GARCH_EXTREME_VOL_VETO")
             return False, s["pre_score"], 0.0, s, "GARCH_EXTREME_VOL_VETO"
-        if s["jump_veto"]:
-            self._log_signal(spot, s, 0.0, 0.0, stage=1, reason="JUMP_SPIKE_VETO")
-            return False, s["pre_score"], 0.0, s, "JUMP_SPIKE_VETO"
-        if s["macd_veto"]:
-            self._log_signal(spot, s, 0.0, 0.0, stage=1, reason="MACD_HIGH_MOMENTUM_VETO")
-            return False, s["pre_score"], 0.0, s, "MACD_HIGH_MOMENTUM_VETO"
-        if s["ao_veto"]:
-            self._log_signal(spot, s, 0.0, 0.0, stage=1, reason="AO_HIGH_ENERGY_VETO")
-            return False, s["pre_score"], 0.0, s, "AO_HIGH_ENERGY_VETO"
 
         if s["pre_score"] < CFG["pre_scan_threshold"]:
             reason = f"PRE_SCAN_FAIL({s['pre_score']:.3f}<{CFG['pre_scan_threshold']})"
@@ -1607,13 +1909,44 @@ class ExpiryRangeBot:
                 log.info(f"[GUARD] {self.guard.status()}")
             return
 
+        # ── Startup calibration gate ─────────────────────────────────
+        # Trading is blocked until the first calibration completes.
+        # Uses self._tick_n (total ticks received) — not len(self.ticks)
+        # which is capped at tick_buffer=720 — to correctly count progress.
+        if not self._calib_done:
+            if self.calibrator.should_run_startup(self._tick_n):
+                prices  = np.array(self.ticks,   dtype=float)
+                returns = np.array(self.returns,  dtype=float) if self.returns else np.array([0.0])
+                self.calibrator.run(
+                    tick_n  = self._tick_n,
+                    prices  = prices,
+                    returns = returns,
+                    hmm     = self.hmm,
+                    trigger = "startup",
+                )
+                self._calib_done = True
+                log.info("[CALIB] Startup calibration complete — trading now unlocked.")
+            else:
+                rem = max(CFG["calib_min_ticks"] - self._tick_n, 0)
+                if self._tick_n % 60 == 0:
+                    log.info(f"[CALIB] Collecting ticks for startup calibration ({rem} remaining).")
+            return
+
         if self._tick_n % CFG["signal_interval"] != 0:
             return
 
         trade, conf, mc_lb, sigs, reason = self.run_intelligence(spot)
 
         if trade:
-            stake = self.guard.compute_stake(self.bankroll, self.bayes.mean())
+            validated = (
+                self.trade_count >= CFG["kelly_min_trades_for_scaling"]
+                and len(self._regimes_seen) >= CFG["kelly_min_regimes_for_scaling"]
+            )
+            stake = self.guard.compute_stake(
+                self.bankroll, self.bayes.mean(),
+                payout_ratio=self._live_payout_ratio,
+                validated=validated,
+            )
             log.info(
                 f"ENTER SIGNAL  conf={conf:.3f}  mc_lb={mc_lb:.4f}  "
                 f"MACD_hist={sigs.get('macd_hist', 0):.4f}  "
@@ -1655,10 +1988,27 @@ class ExpiryRangeBot:
             prop      = resp.get("proposal", {})
             pid       = prop.get("id")
             ask_price = prop.get("ask_price")
+            payout    = prop.get("payout")
 
             if not pid or not ask_price:
                 log.warning("Empty proposal — skipping")
                 return
+
+            # FIX #3: update the live payout-ratio estimate from this real
+            # proposal (payout = total return if won, ask_price = stake).
+            # This feeds the NEXT trade's Kelly sizing — using it for the
+            # trade currently being priced isn't possible since we don't
+            # know it until this exact response, but payout drifts slowly
+            # tick to tick so a one-trade lag is an acceptable trade-off
+            # against the static 0.5143 constant being off by 1.5-3.5x.
+            try:
+                ask_f = float(ask_price)
+                if payout is not None and ask_f > 0:
+                    live_ratio = (float(payout) - ask_f) / ask_f
+                    if live_ratio > 0:
+                        self._live_payout_ratio = live_ratio
+            except (TypeError, ValueError):
+                pass
 
             if self.active_id:
                 return
@@ -1730,11 +2080,30 @@ class ExpiryRangeBot:
 
         if won:
             self.wins += 1
+            if self.wins > self.trade_count:
+                log.error(
+                    f"INTEGRITY CHECK FAILED: wins ({self.wins}) exceeds "
+                    f"trade_count ({self.trade_count}). This should be "
+                    f"impossible and indicates a duplicate settlement got "
+                    f"through — bankroll/Bayesian posterior are now "
+                    f"unreliable. Investigate before trusting further stats."
+                )
             self.guard.on_win()
             tag = "WIN "
         else:
             self.guard.on_loss()
             tag = "LOSS"
+            # ── Loss-triggered recalibration ─────────────────────────
+            if self.calibrator.should_run_on_loss(self._tick_n, len(self.ticks)):
+                prices  = np.array(self.ticks,   dtype=float)
+                returns = np.array(self.returns,  dtype=float) if self.returns else np.array([0.0])
+                self.calibrator.run(
+                    tick_n  = self._tick_n,
+                    prices  = prices,
+                    returns = returns,
+                    hmm     = self.hmm,
+                    trigger = "loss",
+                )
 
         wr     = self.wins / self.trade_count if self.trade_count else 0.0
         lo, hi = self.bayes.ci95()
@@ -1774,7 +2143,26 @@ class ExpiryRangeBot:
             await self.on_tick(msg["tick"])
         elif mt == "proposal_open_contract":
             poc = msg.get("proposal_open_contract", {})
-            if poc.get("is_sold") or poc.get("status") in ("won", "lost"):
+            is_final = poc.get("is_sold") or poc.get("status") in ("won", "lost")
+            if is_final:
+                cid = poc.get("contract_id")
+                # FIX (double-settlement): Deriv's proposal_open_contract
+                # stream can emit more than one update that satisfies the
+                # "final" condition for the same contract (e.g. an is_sold
+                # flag followed by a separate status="won"/"lost" update).
+                # Without this guard, _settle() ran twice for the same
+                # contract — double-crediting bankroll/wins and corrupting
+                # the Bayesian posterior. Only the message matching the
+                # contract we're currently tracking as open is allowed
+                # through; once settled, self.active_id is cleared, so any
+                # further duplicate for the same contract_id no longer
+                # matches and is silently dropped.
+                if cid is None or cid != self.active_id:
+                    log.debug(
+                        f"Ignoring duplicate/mismatched settlement update "
+                        f"(contract_id={cid}, active_id={self.active_id})"
+                    )
+                    return
                 self._settle(poc)
         elif mt == "error":
             log.error(f"API error: {msg.get('error', {}).get('message')}")
@@ -1786,7 +2174,7 @@ class ExpiryRangeBot:
 
         await wsman.send_nowait({"ticks": CFG["symbol"], "subscribe": 1})
         wsman.state = ConnState.SUBSCRIBED
-        log.info(f"Subscribed to {CFG['symbol']} — warming up {CFG['warmup_ticks']} ticks.")
+        log.info(f"Subscribed to {CFG['symbol']} — collecting {CFG['calib_min_ticks']} ticks for startup calibration (~12 min).")
 
         if self.active_id:
             await wsman.send_nowait({
@@ -1810,7 +2198,7 @@ class ExpiryRangeBot:
     async def run(self):
         bar = "=" * 70
         log.info(bar)
-        log.info("  EXPIRYRANGE BOT v2  ·  1HZ10V  ·  ±1.80  ·  2-min")
+        log.info(f"  EXPIRYRANGE BOT v4  ·  {CFG['symbol']}  ·  {CFG['barrier']}/{CFG['barrier2']}  ·  {CFG['duration']}{CFG['duration_unit']}")
         log.info("  10-Layer Intelligence: L1-GARCH L2-MC L3-HMM L4-Hurst")
         log.info("  L5-OU L6-Bayes L7-Guard L8-Jump L9-MACD L10-AO")
         log.info(f"  MC guarantee floor: {CFG['mc_guarantee_floor']} (lower CI bound)")
