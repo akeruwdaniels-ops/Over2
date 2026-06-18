@@ -105,7 +105,7 @@ CFG = {
     "n_contract_ticks": 120,       # 2 min × 60 sec (1HZ10V ticks at ~1/sec)
 
     # ── Capital ──
-    "starting_bankroll": 1.00,
+    "starting_bankroll": 13.00,
     "stake":             0.35,
     "drawdown_stop":     0.10,
 
@@ -123,7 +123,7 @@ CFG = {
     "kelly_fraction":                 0.25,
     "kelly_min_stake":                0.35,
     "kelly_max_fraction_of_bankroll": 0.35,
-    "payout_ratio":                   0.5143,  # fallback seed only, not live truth
+    "payout_ratio":                   0.20,  # fallback seed only, not live truth
 
     # ── Kelly validation gate (FIX: don't scale stake off one short,
     # single-regime session) ──
@@ -1620,7 +1620,7 @@ class ExpiryRangeBot:
         if isinstance(accounts, dict):
             accounts = accounts.get("accounts", accounts.get("data", []))
         for acc in accounts:
-            if acc.get("account_type") == "real":
+            if acc.get("account_type") == "demo":
                 acc_id = acc.get("account_id") or acc.get("id")
                 if acc_id:
                     return acc_id
