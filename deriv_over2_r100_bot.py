@@ -99,8 +99,8 @@ CFG = {
     "duration_unit":    "m",
     # Barrier from calibration JSON: ±2.25 is the widest tested, 45% raw win rate.
     # Auto-calibrator will refine; seed value set to calibrated optimum.
-    "barrier":          "+2.25",
-    "barrier2":         "-2.25",
+    "barrier":          "+2.00",
+    "barrier2":         "-2.00",
     "currency":         "USD",
     "n_contract_ticks": 120,       # 2 min × 60 sec (1HZ10V ticks at ~1/sec)
 
@@ -177,7 +177,7 @@ CFG = {
     # 5 ticks/bar → SMA(34 bars) spans 170 ticks (~2.8 min): meaningful window.
     "ao_fast_period":          5,
     "ao_slow_period":          34,
-    "ao_veto_threshold":       0.85604,  # calibrated from 720 ticks of 1HZ10V
+    "ao_veto_threshold":       0.72538,  # calibrated from 720 ticks of 1HZ10V
     "ao_bar_ticks":            5,
 
     # ── Jump / spike detection (L8) ──
