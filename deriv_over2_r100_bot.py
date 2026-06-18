@@ -106,7 +106,7 @@ CFG = {
 
     # ── Capital ──
     "starting_bankroll": 13.00,
-    "stake":             0.35,
+    "stake":             1.0,
     "drawdown_stop":     0.10,
 
     # ── Kelly staking (FIX 3 + FIX 6) ──
@@ -119,9 +119,9 @@ CFG = {
     # response (payout/ask_price) and tracked live — see
     # ExpiryRangeBot._live_payout_ratio — because realized payout on
     # 1HZ10V has been observed to run 0.14-0.34, nowhere near 0.51.
-    "kelly_activation_bankroll":      1.0,
+    "kelly_activation_bankroll":      10.0,
     "kelly_fraction":                 0.25,
-    "kelly_min_stake":                0.35,
+    "kelly_min_stake":                1.0,
     "kelly_max_fraction_of_bankroll": 0.35,
     "payout_ratio":                   0.20,  # fallback seed only, not live truth
 
