@@ -1721,7 +1721,7 @@ class ExpiryRangeBot:
         if isinstance(accounts, dict):
             accounts = accounts.get("accounts", accounts.get("data", []))
         for acc in accounts:
-            if acc.get("account_type") == "real":
+            if acc.get("account_type") == "demo":
                 acc_id = acc.get("account_id") or acc.get("id")
                 if acc_id:
                     return acc_id
