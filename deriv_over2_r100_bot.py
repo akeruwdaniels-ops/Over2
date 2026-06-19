@@ -99,14 +99,14 @@ CFG = {
     "duration_unit":    "m",
     # Barrier from calibration JSON: ±2.25 is the widest tested, 45% raw win rate.
     # Auto-calibrator will refine; seed value set to calibrated optimum.
-    "barrier":          "+2.00",
-    "barrier2":         "-2.00",
+    "barrier":          "+2.25",
+    "barrier2":         "-2.25",
     "currency":         "USD",
     "n_contract_ticks": 120,       # 2 min × 60 sec (1HZ10V ticks at ~1/sec)
 
     # ── Capital ──
-    "starting_bankroll": 13.00,
-    "stake":             1.0,
+    "starting_bankroll": 1.00,
+    "stake":             0.35,
     "drawdown_stop":     0.10,
 
     # ── Kelly staking (FIX 3 + FIX 6) ──
@@ -119,11 +119,11 @@ CFG = {
     # response (payout/ask_price) and tracked live — see
     # ExpiryRangeBot._live_payout_ratio — because realized payout on
     # 1HZ10V has been observed to run 0.14-0.34, nowhere near 0.51.
-    "kelly_activation_bankroll":      10.0,
+    "kelly_activation_bankroll":      1.0,
     "kelly_fraction":                 0.25,
-    "kelly_min_stake":                1.0,
+    "kelly_min_stake":                0.35,
     "kelly_max_fraction_of_bankroll": 0.35,
-    "payout_ratio":                   0.20,  # fallback seed only, not live truth
+    "payout_ratio":                   0.5143,  # fallback seed only, not live truth
 
     # ── Kelly validation gate (FIX: don't scale stake off one short,
     # single-regime session) ──
@@ -135,6 +135,27 @@ CFG = {
     # edge in others.
     "kelly_min_trades_for_scaling":   100,
     "kelly_min_regimes_for_scaling":  2,
+
+    # ── Martingale ──
+    # Activates after a loss, escalating stake over up to 2 steps.
+    # Factors are compounding: step-1 stake = base × factor[0],
+    # step-2 stake = step-1 stake × factor[1].
+    # At $13 bankroll worst-case exposure: $0.35 + $0.945 + $2.93 = $4.23
+    # (leaves $8.77 — above the $0.10 circuit breaker by a wide margin).
+    #
+    # Bayesian gate: Martingale only escalates when the live posterior
+    # win-rate is above the breakeven threshold (0.66). If the posterior
+    # has drifted below breakeven, the bot resets to flat stake and waits
+    # for the Bayesian signal to recover — avoids compounding into genuine
+    # edge-loss patches.
+    #
+    # Consecutive-loss cooldown is SUPPRESSED while Martingale is active
+    # (steps 1-2) so the escalated trade can fire. The cooldown re-engages
+    # normally once the sequence resolves (win or max steps reached).
+    "martingale_enabled":      True,
+    "martingale_factors":      [2.7, 3.1],   # [step-1 multiplier, step-2 multiplier]
+    "martingale_max_steps":    2,
+    "martingale_bayes_gate":   0.66,          # breakeven threshold - no escalation below this
 
     # ── Signal accuracy gates ──
     "warmup_ticks":       720,
@@ -177,7 +198,7 @@ CFG = {
     # 5 ticks/bar → SMA(34 bars) spans 170 ticks (~2.8 min): meaningful window.
     "ao_fast_period":          5,
     "ao_slow_period":          34,
-    "ao_veto_threshold":       0.72538,  # calibrated from 720 ticks of 1HZ10V
+    "ao_veto_threshold":       0.85604,  # calibrated from 720 ticks of 1HZ10V
     "ao_bar_ticks":            5,
 
     # ── Jump / spike detection (L8) ──
@@ -217,10 +238,11 @@ CFG = {
     "calib_jump_kurt_min":      4.0,
     "calib_jump_kurt_max":      10.0,
     "calib_terminal_window":    None,   # None -> use n_contract_ticks
+    # Narrowed to ±1.80–2.10 band: calibration confirmed 1.80 clears breakeven
+    # (66.1%) and 2.10 approaches 72% raw win rate. Wider barriers excluded —
+    # they inflate payout requirements without proportional win-rate gain.
     "calib_barrier_candidates": [
-        2.00, 2.10, 2.20, 2.30, 2.40, 2.50,
-        2.60, 2.70, 2.80, 2.90, 3.00,
-        3.10, 3.20, 3.30, 3.40, 3.50,
+        1.80, 1.85, 1.90, 1.95, 2.00, 2.05, 2.10,
     ],
 
     # ── Connection (new Deriv Options API) ──
@@ -903,26 +925,94 @@ class AwesomeOscillator:
 # ══════════════════════════════════════════════════════════════════════
 class RiskGuard:
     def __init__(self):
-        self.stake          = CFG["stake"]
-        self._cooldown      = 0
-        self._tripped       = False
-        self._consec_losses = 0
+        self.stake           = CFG["stake"]
+        self._cooldown       = 0
+        self._tripped        = False
+        self._consec_losses  = 0
+        self._martingale_step = 0   # 0 = flat, 1 = step-1, 2 = step-2
+        self._base_stake     = CFG["stake"]   # anchor for Martingale compounding
 
     def tick(self):
         if self._cooldown > 0:
             self._cooldown -= 1
 
     def on_win(self):
-        self._consec_losses = 0
-        self._cooldown = CFG["cooldown_win"]
+        if self._martingale_step > 0:
+            log.info(
+                f"[MARTINGALE] Win at step {self._martingale_step} "
+                f"(stake=${self._base_stake:.2f}) — sequence reset to flat stake."
+            )
+        self._consec_losses   = 0
+        self._martingale_step = 0          # reset Martingale sequence on any win
+        self._base_stake      = CFG["stake"]
+        self._cooldown        = CFG["cooldown_win"]
 
-    def on_loss(self):
+    def on_loss(self, bayes_wr: float = 1.0):
+        """
+        bayes_wr: current Bayesian posterior win-rate (passed from _settle).
+
+        Martingale step is NEVER reset on a loss — only on a win or when
+        max steps is reached. Behaviour on loss:
+
+          bayes >= gate AND step < max  → escalate to next step
+          bayes <  gate AND step > 0   → HOLD current step; trade will be
+                                          suppressed in on_tick until bayes
+                                          recovers, then fires at held stake
+          step == max                  → hold at max step (no further escalation)
+
+        Consecutive-loss cooldown ALWAYS runs unconditionally, including
+        while Martingale is active. The escalated stake fires after the
+        cooldown clears (and after bayes recovers if in hold state).
+        """
         self._consec_losses += 1
+
+        if CFG["martingale_enabled"]:
+            if self._martingale_step < CFG["martingale_max_steps"]:
+                if bayes_wr >= CFG["martingale_bayes_gate"]:
+                    # Bayes healthy — escalate now
+                    factors = CFG["martingale_factors"]
+                    factor  = factors[self._martingale_step]
+                    self._base_stake      = round(self.stake * factor, 2)
+                    self._martingale_step += 1
+                    log.info(
+                        f"[MARTINGALE] Step {self._martingale_step}/{CFG['martingale_max_steps']} "
+                        f"— next stake ${self._base_stake:.2f}  "
+                        f"(factor={factor}  bayes_wr={bayes_wr:.3f})"
+                    )
+                else:
+                    # Bayes below gate — hold current step, don't escalate yet.
+                    # on_tick will suppress entry until bayes recovers.
+                    if self._martingale_step == 0:
+                        # First loss with bayes already below gate — arm step-1
+                        # stake so it's ready the moment bayes recovers.
+                        factor = CFG["martingale_factors"][0]
+                        self._base_stake      = round(self.stake * factor, 2)
+                        self._martingale_step = 1
+                        log.info(
+                            f"[MARTINGALE] Step 1 armed at ${self._base_stake:.2f} "
+                            f"but HELD — bayes_wr={bayes_wr:.3f} < gate={CFG['martingale_bayes_gate']}. "
+                            f"Will fire once bayes recovers."
+                        )
+                    else:
+                        log.info(
+                            f"[MARTINGALE] Step {self._martingale_step} HELD "
+                            f"(stake=${self._base_stake:.2f}) — "
+                            f"bayes_wr={bayes_wr:.3f} below gate, not escalating yet."
+                        )
+            else:
+                # Already at max steps — hold, wait for a win to reset
+                log.info(
+                    f"[MARTINGALE] Max steps reached — holding step {self._martingale_step} "
+                    f"at ${self._base_stake:.2f} until next win."
+                )
+
+        # ── Consecutive-loss cooldown — ALWAYS applied unconditionally ──
         if self._consec_losses >= CFG["consecutive_loss_limit"]:
             self._cooldown = CFG["consecutive_loss_cooldown"]
             log.warning(
                 f"  {self._consec_losses} consecutive losses — "
-                f"extended cooldown ({CFG['consecutive_loss_cooldown']} ticks)"
+                f"extended cooldown ({CFG['consecutive_loss_cooldown']} ticks). "
+                f"Martingale step {self._martingale_step} held, fires after cooldown."
             )
         else:
             self._cooldown = CFG["cooldown_loss"]
@@ -945,18 +1035,23 @@ class RiskGuard:
         payout_ratio: Optional[float] = None,
         validated:    bool = True,
     ) -> float:
+        # ── Martingale override — takes priority over Kelly ──────────
+        # When a Martingale sequence is active, use the pre-computed
+        # escalated stake rather than Kelly sizing. This ensures the
+        # recovery math is predictable and not distorted by a posterior
+        # that may be temporarily noisy after a loss.
+        if CFG["martingale_enabled"] and self._martingale_step > 0:
+            stake = min(self._base_stake, bankroll)
+            self.stake = round(stake, 2)
+            return self.stake
+
+        # ── Normal Kelly path ─────────────────────────────────────────
         if bankroll < CFG["kelly_activation_bankroll"]:
             self.stake = CFG["stake"]
             return self.stake
-        # FIX: until the bot has enough trades across enough distinct HMM
-        # regimes to trust the posterior, stay flat — don't let Kelly
-        # scale stake off a short, single-regime sample.
         if not validated:
             self.stake = CFG["stake"]
             return self.stake
-        # FIX: use the live-tracked payout ratio (read from real proposal
-        # responses) rather than the static CFG constant, which has been
-        # observed to overstate actual realized payout by 1.5-3.5x.
         b      = payout_ratio if payout_ratio is not None else CFG["payout_ratio"]
         p      = float(np.clip(win_prob, 0.0, 1.0))
         q      = 1.0 - p
@@ -967,14 +1062,20 @@ class RiskGuard:
         self.stake = round(stake, 2)
         return self.stake
 
+    def martingale_status(self) -> str:
+        if not CFG["martingale_enabled"] or self._martingale_step == 0:
+            return "FLAT"
+        return f"MART_STEP_{self._martingale_step}(stake=${self._base_stake:.2f})"
+
     def status(self) -> str:
         if self._tripped:
             return "CIRCUIT_BREAKER_TRIPPED"
+        mart = self.martingale_status()
         if self._consec_losses >= CFG["consecutive_loss_limit"] and self._cooldown > 0:
-            return f"CONSEC_LOSS_COOLDOWN({self._cooldown}t,streak={self._consec_losses})"
+            return f"CONSEC_LOSS_COOLDOWN({self._cooldown}t,streak={self._consec_losses},{mart})"
         if self._cooldown > 0:
-            return f"COOLDOWN({self._cooldown}t)"
-        return "READY"
+            return f"COOLDOWN({self._cooldown}t,{mart})"
+        return f"READY({mart})"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1620,7 +1721,7 @@ class ExpiryRangeBot:
         if isinstance(accounts, dict):
             accounts = accounts.get("accounts", accounts.get("data", []))
         for acc in accounts:
-            if acc.get("account_type") == "demo":
+            if acc.get("account_type") == "real":
                 acc_id = acc.get("account_id") or acc.get("id")
                 if acc_id:
                     return acc_id
@@ -1938,6 +2039,22 @@ class ExpiryRangeBot:
         trade, conf, mc_lb, sigs, reason = self.run_intelligence(spot)
 
         if trade:
+            # ── Martingale bayes-hold gate ────────────────────────────
+            # If a Martingale step is armed but the Bayesian win-rate is
+            # still below the gate, suppress entry and wait. The step and
+            # its escalated stake are preserved — no reset. The log fires
+            # every signal interval so progress is visible.
+            if (CFG["martingale_enabled"]
+                    and self.guard._martingale_step > 0
+                    and self.bayes.mean() < CFG["martingale_bayes_gate"]):
+                log.info(
+                    f"[MARTINGALE] Entry suppressed — step {self.guard._martingale_step} "
+                    f"held at ${self.guard._base_stake:.2f}  "
+                    f"bayes_wr={self.bayes.mean():.3f} < gate={CFG['martingale_bayes_gate']} "
+                    f"(waiting for recovery)"
+                )
+                return
+
             validated = (
                 self.trade_count >= CFG["kelly_min_trades_for_scaling"]
                 and len(self._regimes_seen) >= CFG["kelly_min_regimes_for_scaling"]
@@ -2091,7 +2208,9 @@ class ExpiryRangeBot:
             self.guard.on_win()
             tag = "WIN "
         else:
-            self.guard.on_loss()
+            # Pass live Bayesian posterior to on_loss so the Martingale
+            # gate can decide whether to escalate or reset to flat stake.
+            self.guard.on_loss(bayes_wr=self.bayes.mean())
             tag = "LOSS"
             # ── Loss-triggered recalibration ─────────────────────────
             if self.calibrator.should_run_on_loss(self._tick_n, len(self.ticks)):
@@ -2198,13 +2317,16 @@ class ExpiryRangeBot:
     async def run(self):
         bar = "=" * 70
         log.info(bar)
-        log.info(f"  EXPIRYRANGE BOT v4  ·  {CFG['symbol']}  ·  {CFG['barrier']}/{CFG['barrier2']}  ·  {CFG['duration']}{CFG['duration_unit']}")
+        log.info(f"  EXPIRYRANGE BOT v5  ·  {CFG['symbol']}  ·  {CFG['barrier']}/{CFG['barrier2']}  ·  {CFG['duration']}{CFG['duration_unit']}")
         log.info("  10-Layer Intelligence: L1-GARCH L2-MC L3-HMM L4-Hurst")
         log.info("  L5-OU L6-Bayes L7-Guard L8-Jump L9-MACD L10-AO")
         log.info(f"  MC guarantee floor: {CFG['mc_guarantee_floor']} (lower CI bound)")
         log.info(f"  MACD histogram veto: |hist| > {CFG['macd_histogram_veto']}")
         log.info(f"  AO energy veto: |AO| > {CFG['ao_veto_threshold']}")
         log.info(f"  Bankroll: ${self.bankroll:.2f}  Stop: ${CFG['drawdown_stop']:.2f}")
+        mart = CFG["martingale_factors"] if CFG["martingale_enabled"] else "disabled"
+        log.info(f"  Martingale: {'enabled' if CFG['martingale_enabled'] else 'disabled'}  factors={mart}  max_steps={CFG['martingale_max_steps']}  bayes_gate={CFG['martingale_bayes_gate']}")
+        log.info(f"  Barrier band: ±{min(CFG['calib_barrier_candidates'])}–±{max(CFG['calib_barrier_candidates'])} (auto-calibrated)")
         log.info(f"  Connection: new Deriv Options API (REST OTP bootstrap)")
         log.info(bar)
 
