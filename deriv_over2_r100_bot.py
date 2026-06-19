@@ -99,14 +99,14 @@ CFG = {
     "duration_unit":    "m",
     # Barrier from calibration JSON: ±2.25 is the widest tested, 45% raw win rate.
     # Auto-calibrator will refine; seed value set to calibrated optimum.
-    "barrier":          "+2.25",
-    "barrier2":         "-2.25",
+    "barrier":          "+2.00",
+    "barrier2":         "-2.00",
     "currency":         "USD",
     "n_contract_ticks": 120,       # 2 min × 60 sec (1HZ10V ticks at ~1/sec)
 
     # ── Capital ──
-    "starting_bankroll": 1.00,
-    "stake":             0.35,
+    "starting_bankroll": 20.00,
+    "stake":             0.75,
     "drawdown_stop":     0.10,
 
     # ── Kelly staking (FIX 3 + FIX 6) ──
@@ -119,9 +119,9 @@ CFG = {
     # response (payout/ask_price) and tracked live — see
     # ExpiryRangeBot._live_payout_ratio — because realized payout on
     # 1HZ10V has been observed to run 0.14-0.34, nowhere near 0.51.
-    "kelly_activation_bankroll":      1.0,
+    "kelly_activation_bankroll":      18.0,
     "kelly_fraction":                 0.25,
-    "kelly_min_stake":                0.35,
+    "kelly_min_stake":                0.7,
     "kelly_max_fraction_of_bankroll": 0.35,
     "payout_ratio":                   0.5143,  # fallback seed only, not live truth
 
