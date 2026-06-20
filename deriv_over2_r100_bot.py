@@ -155,7 +155,7 @@ CFG = {
     "martingale_enabled":      True,
     "martingale_factors":      [1.18, 1.5],   # [step-1 multiplier, step-2 multiplier]
     "martingale_max_steps":    2,
-    "martingale_bayes_gate":   0.66,          # breakeven threshold - no escalation below this
+    "martingale_bayes_gate":   0.50,          # breakeven threshold - no escalation below this
 
     # ── Signal accuracy gates ──
     "warmup_ticks":       720,
