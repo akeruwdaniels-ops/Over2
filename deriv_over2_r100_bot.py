@@ -105,8 +105,8 @@ CFG = {
     "n_contract_ticks": 120,       # 2 min × 60 sec (1HZ10V ticks at ~1/sec)
 
     # ── Capital ──
-    "starting_bankroll": 20.00,
-    "stake":             0.75,
+    "starting_bankroll": 2.00,
+    "stake":             0.35,
     "drawdown_stop":     0.10,
 
     # ── Kelly staking (FIX 3 + FIX 6) ──
@@ -119,9 +119,9 @@ CFG = {
     # response (payout/ask_price) and tracked live — see
     # ExpiryRangeBot._live_payout_ratio — because realized payout on
     # 1HZ10V has been observed to run 0.14-0.34, nowhere near 0.51.
-    "kelly_activation_bankroll":      18.0,
+    "kelly_activation_bankroll":      3.0,
     "kelly_fraction":                 0.25,
-    "kelly_min_stake":                0.7,
+    "kelly_min_stake":                0.35,
     "kelly_max_fraction_of_bankroll": 0.35,
     "payout_ratio":                   0.5143,  # fallback seed only, not live truth
 
@@ -153,7 +153,7 @@ CFG = {
     # (steps 1-2) so the escalated trade can fire. The cooldown re-engages
     # normally once the sequence resolves (win or max steps reached).
     "martingale_enabled":      True,
-    "martingale_factors":      [2.7, 3.1],   # [step-1 multiplier, step-2 multiplier]
+    "martingale_factors":      [1.18, 1.5],   # [step-1 multiplier, step-2 multiplier]
     "martingale_max_steps":    2,
     "martingale_bayes_gate":   0.66,          # breakeven threshold - no escalation below this
 
@@ -1721,7 +1721,7 @@ class ExpiryRangeBot:
         if isinstance(accounts, dict):
             accounts = accounts.get("accounts", accounts.get("data", []))
         for acc in accounts:
-            if acc.get("account_type") == "demo":
+            if acc.get("account_type") == "real":
                 acc_id = acc.get("account_id") or acc.get("id")
                 if acc_id:
                     return acc_id
